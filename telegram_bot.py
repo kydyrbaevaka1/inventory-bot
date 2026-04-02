@@ -1,23 +1,33 @@
-import csv
+import json
 import logging
 import os
 import re
 from datetime import datetime
 
+import gspread
 from dotenv import load_dotenv
+from google.oauth2.service_account import Credentials
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.environ.get("INVENTORY_TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
-CSV_FILE = os.path.join(os.path.dirname(__file__), "inventory.csv")
+TELEGRAM_TOKEN = os.environ.get("INVENTORY_TELEGRAM_TOKEN", "")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1wMmk_PLxhCjx6zljYl-bGcfDv_me-tKX-OWrzK1d0no")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+HEADERS = ["Тауар аты", "Бастапқы қалдық", "Сатылды", "Қалдық", "Соңғы сату"]
 
 HELP_TEXT = (
     "Инвентарь боты — пайдалану:\n\n"
@@ -30,75 +40,72 @@ HELP_TEXT = (
 )
 
 
-def ensure_csv():
-    if not os.path.exists(CSV_FILE):
-        with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Тауар аты", "Бастапқы қалдық", "Сатылды", "Қалдық", "Соңғы сату"])
+def get_sheet():
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        sheet = spreadsheet.worksheet("Инвентарь")
+    except gspread.WorksheetNotFound:
+        sheet = spreadsheet.add_worksheet(title="Инвентарь", rows=1000, cols=5)
+        sheet.append_row(HEADERS)
+    return sheet
 
 
-def read_inventory() -> dict:
-    ensure_csv()
+def read_inventory(sheet) -> dict:
+    rows = sheet.get_all_records(expected_headers=HEADERS)
     inventory = {}
-    with open(CSV_FILE, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row["Тауар аты"]
-            inventory[name.lower()] = {
-                "name": name,
-                "initial": float(row["Бастапқы қалдық"] or 0),
-                "sold": float(row["Сатылды"] or 0),
-                "remaining": float(row["Қалдық"] or 0),
-                "last_sale": row["Соңғы сату"],
-            }
+    for row in rows:
+        name = row["Тауар аты"]
+        if not name:
+            continue
+        inventory[name.lower()] = {
+            "name": name,
+            "initial": float(row["Бастапқы қалдық"] or 0),
+            "sold": float(row["Сатылды"] or 0),
+            "remaining": float(row["Қалдық"] or 0),
+            "last_sale": row["Соңғы сату"],
+            "row_index": rows.index(row) + 2,  # +2: header row + 1-indexed
+        }
     return inventory
 
 
-def write_inventory(inventory: dict):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Тауар аты", "Бастапқы қалдық", "Сатылды", "Қалдық", "Соңғы сату"])
-        for item in inventory.values():
-            writer.writerow([
-                item["name"],
-                item["initial"],
-                item["sold"],
-                item["remaining"],
-                item["last_sale"],
-            ])
-
-
 def add_sale(product: str, quantity: float) -> dict:
-    inventory = read_inventory()
+    sheet = get_sheet()
+    inventory = read_inventory(sheet)
     key = product.lower()
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     if key in inventory:
         item = inventory[key]
-        item["sold"] += quantity
-        item["remaining"] = item["initial"] - item["sold"]
-        item["last_sale"] = now
+        new_sold = item["sold"] + quantity
+        new_remaining = item["initial"] - new_sold
+        row_idx = item["row_index"]
+        # Update columns: C=sold, D=remaining, E=last_sale
+        sheet.update_cell(row_idx, 3, new_sold)
+        sheet.update_cell(row_idx, 4, new_remaining)
+        sheet.update_cell(row_idx, 5, now)
         is_new = False
-    else:
-        inventory[key] = {
-            "name": product,
-            "initial": 0,
+        return {
+            "success": True,
+            "product": product,
             "sold": quantity,
-            "remaining": -quantity,
-            "last_sale": now,
+            "totalSold": new_sold,
+            "remaining": new_remaining,
+            "isNew": is_new,
         }
-        is_new = True
-
-    write_inventory(inventory)
-    item = inventory[key]
-    return {
-        "success": True,
-        "product": product,
-        "sold": quantity,
-        "totalSold": item["sold"],
-        "remaining": item["remaining"],
-        "isNew": is_new,
-    }
+    else:
+        new_row = [product, 0, quantity, -quantity, now]
+        sheet.append_row(new_row)
+        return {
+            "success": True,
+            "product": product,
+            "sold": quantity,
+            "totalSold": quantity,
+            "remaining": -quantity,
+            "isNew": True,
+        }
 
 
 def parse_message(text: str):
@@ -132,7 +139,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    inventory = read_inventory()
+    try:
+        sheet = get_sheet()
+        inventory = read_inventory(sheet)
+    except Exception as e:
+        logger.error("Sheets қатесі: %s", e)
+        await update.message.reply_text("Google Sheets қосылу қатесі.")
+        return
 
     if not inventory:
         await update.message.reply_text("Тізім бос.")
@@ -160,7 +173,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     product, quantity = parsed
-    result = add_sale(product, quantity)
+
+    try:
+        result = add_sale(product, quantity)
+    except Exception as e:
+        logger.error("Sheets жазу қатесі: %s", e)
+        await update.message.reply_text("Google Sheets жазу қатесі. Кейін қайталаңыз.")
+        return
 
     await update.message.reply_text(
         f"Жазылды: {result['product']}\n"
@@ -171,14 +190,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
-    import sys, io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-
-    if TELEGRAM_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("TELEGRAM_TOKEN орнатылмаган!")
+    if not TELEGRAM_TOKEN:
+        print("INVENTORY_TELEGRAM_TOKEN орнатылмаган!")
         return
 
-    ensure_csv()
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        print("GOOGLE_SERVICE_ACCOUNT_JSON орнатылмаган!")
+        return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
