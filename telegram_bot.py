@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import traceback
 from datetime import datetime
 
 import gspread
@@ -143,7 +144,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         sheet = get_sheet()
         inventory = read_inventory(sheet)
     except Exception as e:
-        logger.error("Sheets қатесі: %s", e)
+        logger.error("Sheets қатесі: %s\n%s", repr(e), traceback.format_exc())
         await update.message.reply_text("Google Sheets қосылу қатесі.")
         return
 
@@ -177,7 +178,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         result = add_sale(product, quantity)
     except Exception as e:
-        logger.error("Sheets жазу қатесі: %s", e)
+        logger.error("Sheets жазу қатесі: %s\n%s", repr(e), traceback.format_exc())
         await update.message.reply_text("Google Sheets жазу қатесі. Кейін қайталаңыз.")
         return
 
