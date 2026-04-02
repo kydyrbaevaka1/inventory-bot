@@ -7,7 +7,6 @@ from datetime import datetime
 
 import gspread
 from dotenv import load_dotenv
-from google.oauth2.service_account import Credentials
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -16,11 +15,6 @@ load_dotenv()
 TELEGRAM_TOKEN = os.environ.get("INVENTORY_TELEGRAM_TOKEN", "")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1wMmk_PLxhCjx6zljYl-bGcfDv_me-tKX-OWrzK1d0no")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-
-SCOPES = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -43,8 +37,7 @@ HELP_TEXT = (
 
 def get_sheet():
     creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    gc = gspread.authorize(creds)
+    gc = gspread.service_account_from_dict(creds_dict)
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
     try:
         sheet = spreadsheet.worksheet("Инвентарь")
